@@ -3,12 +3,14 @@ package at
 import (
 	"bufio"
 	"errors"
+	"log"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/xlab/at/pdu"
 	"github.com/xlab/at/sms"
+	"golang.org/x/sys/unix"
 )
 
 // DefaultTimeout to close the connection in case of modem is being not responsive at all.
@@ -93,7 +95,6 @@ func (d *Device) Closed() <-chan struct{} {
 // entered after the device replied with '>') and then the second part of payload
 // should be sent (the second payload will be sent using Send).
 func (d *Device) sendInteractive(part1, part2 string, prompt byte) (reply string, err error) {
-
 	err = d.withTimeout(func() error {
 		_, err := d.cmdPort.Write([]byte(part1 + Sep))
 		if err != nil {
@@ -152,6 +153,7 @@ func (d *Device) Send(req string) (reply string, err error) {
 		if line, err = buf.ReadString('\r'); err != nil {
 			return err
 		}
+
 		text := strings.TrimSpace(line)
 		if !strings.HasPrefix(req, text) {
 			return err
@@ -190,10 +192,10 @@ func (d *Device) Send(req string) (reply string, err error) {
 		return err
 	})
 
-	return
+	return reply, err
 }
 
-// runs the passed method with a timeout set on the cmdPort
+// runs the passed method with a timeout set on the cmdPort.
 func (d *Device) withTimeout(f func() error) error {
 	timeout := d.Timeout
 	if timeout == 0 {
@@ -359,9 +361,14 @@ func (d *Device) handleReport(str string) (err error) {
 // Open is used to open serial ports of the device. This should be used first.
 // The method returns error if open was not succeed, i.e. if device is absent.
 func (d *Device) Open() (err error) {
-	if d.cmdPort, err = os.OpenFile(d.CommandPort, os.O_RDWR, 0); err != nil {
+	if d.cmdPort, err = os.OpenFile(d.CommandPort, os.O_RDWR|unix.O_NOCTTY|unix.O_NONBLOCK, 0o666); err != nil {
 		return
 	}
+
+	if err := setBaudrate(d.cmdPort); err != nil {
+		log.Println("unable to set baudrate:", err)
+	}
+
 	if d.NotifyPort != "" && d.NotifyPort != d.CommandPort {
 		if d.notifyPort, err = os.OpenFile(d.NotifyPort, os.O_RDWR, 0); err != nil {
 			d.cmdPort.Close()
@@ -369,6 +376,26 @@ func (d *Device) Open() (err error) {
 		}
 	}
 	return
+}
+
+func setBaudrate(file *os.File) error {
+	fd := int(file.Fd())
+	termios, err := unix.IoctlGetTermios(fd, unix.TCGETS2)
+	if err != nil {
+		return err
+	}
+
+	termios.Oflag = unix.ONLCR // map \n to \r\n on output
+	termios.Cflag = unix.CS8 | // character size (8 Bit)
+		unix.CREAD | // enable receiver
+		unix.HUPCL | // hang up alter last process closes
+		unix.CLOCAL | // ignore modem control lines
+		unix.B9600 // baudrate
+
+	termios.Cc[unix.VMIN] = 1  // read at least 1 character
+	termios.Cc[unix.VTIME] = 0 // no timeout
+
+	return unix.IoctlSetTermios(fd, unix.TCSETSF2, termios)
 }
 
 // Init checks whether device is opened, initializes event channels
